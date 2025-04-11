@@ -49,7 +49,7 @@ private:
     #endif
     }
 
-    #if defined(__AVX512F__) && defined(__VAES__)
+    #if defined(__AVX512F__)
         // x86 512-bit implementation
         using Vector = __m512i;
 
@@ -57,24 +57,26 @@ private:
             return _mm512_xor_si512(lhs, rhs);
         }
 
+        #if defined(__VAES__)
         static __m512i Enc(__m512i aes, __m512i key) {
             return _mm512_aesenc_epi128(aes, key);
         }
+        #endif
 
         static __m512i Rot(__m512i value, __m512i shift) {
             return _mm512_rolv_epi32(value, shift);
         }
 
-        static __m512i Load(const void* ptr) {
+        static __m512i Load512(const void* ptr) {
             return _mm512_loadu_si512(ptr);
         }
 
-        static __m512i Load(const void* ptr, size_t bytes) {
+        static __m512i Load512(const void* ptr, size_t bytes) {
             uint64_t mask = 0xFFFFFFFFFFFFFFFFull >> (64 - bytes);
             return _mm512_maskz_loadu_epi8(mask, ptr);
         }
 
-        static __m512i SetAll(const uint64_t value) {
+        static __m512i SetAll512(const uint64_t value) {
             return _mm512_set1_epi64(value);
         }
 
@@ -83,28 +85,50 @@ private:
             return _mm512_extracti32x4_epi32(vector, N);
         }
 
-    #else
-        static __m128i Load(const void* ptr) {
-            return _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-        }
-
-        static __m128i Load(const void* ptr, size_t bytes) {
-        #if defined(__AVX512F__)
-            uint64_t mask = 0xFFFFu >> (sizeof(__m128i) - bytes);
-            return _mm_maskz_loadu_epi8(mask, ptr);
-        #else
-            // TODO: replace with the old _mm_shuffle_epi8 masked load trick
-            alignas(sizeof(__m128i)) uint8_t buffer[sizeof(__m128i)];
-            memset(buffer, 0, sizeof(buffer));
-            memcpy(buffer, ptr, bytes);
-            return Load(buffer);
-        #endif
-        }
-
-        static __m128i SetAll(const uint64_t value) {
-            return _mm_set1_epi64x(value);
-        }
     #endif
+
+    static __m128i Load128(const void* ptr) {
+        return _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
+    }
+
+    static __m128i Load128(const void* ptr, size_t bytes) {
+    #if defined(__AVX512F__)
+        uint64_t mask = 0xFFFFu >> (sizeof(__m128i) - bytes);
+        return _mm_maskz_loadu_epi8(mask, ptr);
+    #else
+        static const uint8_t zero_mask[32] = {
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+
+        static const uint8_t shuf_mask[32] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        };
+
+        // safely handle unaligned loads that may span page boundaries
+        __m128i buffer;
+        auto offset = reinterpret_cast<uintptr_t>(ptr) % 16;
+        auto pshufb = Load128(&shuf_mask[offset]);
+        auto output = Load128(&zero_mask[16 - bytes]);
+        if (offset + bytes > 16)
+            buffer = Load128(ptr);
+        else {
+            buffer = Load128(static_cast<const char*>(ptr) - offset);
+            buffer = _mm_shuffle_epi8(buffer, pshufb);
+        }
+        buffer = _mm_and_si128(buffer, output);
+        return buffer;
+    #endif
+    }
+
+    static __m128i SetAll128(const uint64_t value) {
+        return _mm_set1_epi64x(value);
+    }
 #else
 #error unsupported architecture
 #endif
@@ -157,85 +181,76 @@ public:
     static Scalar Hash(const void* data, const size_t size, uint64_t seed = 0) {
         size_t bytes = size;
 
-        const Vector c0 = Load(&Constant[sizeof(Vector) * 0]);
-        const Vector c1 = Load(&Constant[sizeof(Vector) * 1]);
-        const Vector c2 = Load(&Constant[sizeof(Vector) * 2]);
-        const Vector c3 = Load(&Constant[sizeof(Vector) * 3]);
+        const Vector c0 = Load512(&Constant[sizeof(Vector) * 0]);
+        const Vector c1 = Load512(&Constant[sizeof(Vector) * 1]);
+        const Vector c2 = Load512(&Constant[sizeof(Vector) * 2]);
+        const Vector c3 = Load512(&Constant[sizeof(Vector) * 3]);
 
         Vector v0 = c0;
         Vector v1 = c1;
         Vector v2 = c2;
         Vector v3 = c3;
 
-        v0 = Xor(v0, SetAll(seed));
+        v0 = Xor(v0, SetAll512(seed));
 
         const Vector* key = reinterpret_cast<const Vector*>(data);
         // bulk loop
         if (bytes >= 256)
             do {
-                v0 = Enc(v0, Load(key++));
-                v1 = Enc(v1, Load(key++));
-                v2 = Enc(v2, Load(key++));
-                v3 = Enc(v3, Load(key++));
+                v0 = Enc(v0, Load512(key++));
+                v1 = Enc(v1, Load512(key++));
+                v2 = Enc(v2, Load512(key++));
+                v3 = Enc(v3, Load512(key++));
             }
             while ((bytes -= 256) >= 256);
 
-        v1 = Xor(v1, SetAll(size));
+        v1 = Xor(v1, SetAll512(size));
 
         // remainder
         if (bytes > 0) {
             if (bytes >=  64)
-                v0 = Enc(v0, Load(key++));
+                v0 = Enc(v0, Load512(key++));
             if (bytes >= 128)
-                v1 = Enc(v1, Load(key++));
+                v1 = Enc(v1, Load512(key++));
             if (bytes >= 192)
-                v2 = Enc(v2, Load(key++));
+                v2 = Enc(v2, Load512(key++));
             if (bytes %=  64)
-                v3 = Enc(v3, Load(key, bytes));
+                v3 = Enc(v3, Load512(key, bytes));
         }
-        {   // 4x state reduction
-            Vector m0, m1, m2, m3;
-            m0 = Enc(Xor(Rot(v1, v0), v0), Rot(c1, v2));
-            m1 = Enc(Xor(Rot(v2, v1), v1), Rot(c0, v3));
-            m2 = Enc(Xor(Rot(v3, v2), v2), Rot(c3, v0));
-            m3 = Enc(Xor(Rot(v0, v3), v3), Rot(c2, v1));
 
-            m0 = Enc(Xor(Rot(v2, v0), m0), Rot(c2, v3));
-            m1 = Enc(Xor(Rot(v3, v1), m1), Rot(c3, v2));
-            m2 = Enc(Xor(Rot(v0, v2), m2), Rot(c0, v1));
-            m3 = Enc(Xor(Rot(v1, v3), m3), Rot(c1, v0));
+        Vector m0, m1, m2, m3;
+        m0 = Enc(Xor(Rot(v1, v0), v0), Rot(c1, v2));
+        m1 = Enc(Xor(Rot(v2, v1), v1), Rot(c0, v3));
+        m2 = Enc(Xor(Rot(v3, v2), v2), Rot(c3, v0));
+        m3 = Enc(Xor(Rot(v0, v3), v3), Rot(c2, v1));
 
-            m0 = Enc(Xor(Rot(v3, v0), m0), Rot(c3, v1));
-            m1 = Enc(Xor(Rot(v0, v1), m1), Rot(c2, v0));
-            m2 = Enc(Xor(Rot(v1, v2), m2), Rot(c1, v3));
-            m3 = Enc(Xor(Rot(v2, v3), m3), Rot(c0, v2));
+        m0 = Enc(Xor(Rot(v2, v0), m0), Rot(c2, v3));
+        m1 = Enc(Xor(Rot(v3, v1), m1), Rot(c3, v2));
+        m2 = Enc(Xor(Rot(v0, v2), m2), Rot(c0, v1));
+        m3 = Enc(Xor(Rot(v1, v3), m3), Rot(c1, v0));
 
-            v0 = Xor(Xor(m0, m1), Xor(m2, m3));
-        }
+        m0 = Enc(Xor(Rot(v3, v0), m0), Rot(c3, v1));
+        m1 = Enc(Xor(Rot(v0, v1), m1), Rot(c2, v0));
+        m2 = Enc(Xor(Rot(v1, v2), m2), Rot(c1, v3));
+        m3 = Enc(Xor(Rot(v2, v3), m3), Rot(c0, v2));
+
+        v0 = Xor(Xor(m0, m1), Xor(m2, m3));
+
+        m0 = v0;
+        m1 = _mm512_shuffle_i32x4(v0, v0, 0x39);
+        m2 = _mm512_shuffle_i32x4(v0, v0, 0x4E);
+        m3 = _mm512_shuffle_i32x4(v0, v0, 0x93);
+
+        v0 = Enc(Xor(Rot(m1, m0), v0), m3);
+        v0 = Enc(Xor(Rot(m2, m0), v0), m1);
+        v0 = Enc(Xor(Rot(m3, m0), v0), m2);
+
         Scalar s0 = Lane<0>(v0);
         Scalar s1 = Lane<1>(v0);
         Scalar s2 = Lane<2>(v0);
         Scalar s3 = Lane<3>(v0);
-        {   // 4x state reduction
-            Scalar m0, m1, m2, m3;
-            m0 = Enc(Xor(Rot(s1, s0), s0), s3);
-            m1 = Enc(Xor(Rot(s2, s1), s1), s0);
-            m2 = Enc(Xor(Rot(s3, s2), s2), s1);
-            m3 = Enc(Xor(Rot(s0, s3), s3), s2);
 
-            m0 = Enc(Xor(Rot(s2, s0), m0), s1);
-            m1 = Enc(Xor(Rot(s3, s1), m1), s2);
-            m2 = Enc(Xor(Rot(s0, s2), m2), s3);
-            m3 = Enc(Xor(Rot(s1, s3), m3), s0);
-
-            m0 = Enc(Xor(Rot(s3, s0), m0), s2);
-            m1 = Enc(Xor(Rot(s0, s1), m1), s3);
-            m2 = Enc(Xor(Rot(s1, s2), m2), s0);
-            m3 = Enc(Xor(Rot(s2, s3), m3), s1);
-
-            s0 = Xor(Xor(m0, m1), Xor(m2, m3));
-        }
-        return s0;
+        return Xor(Xor(s0, s1), Xor(s2, s3));
     }
 
 #else
@@ -250,22 +265,22 @@ public:
         size_t bytes = size;
 
         Scalar c[16] = {
-            Load(&Constant[sizeof(Scalar) *  0]),
-            Load(&Constant[sizeof(Scalar) *  1]),
-            Load(&Constant[sizeof(Scalar) *  2]),
-            Load(&Constant[sizeof(Scalar) *  3]),
-            Load(&Constant[sizeof(Scalar) *  4]),
-            Load(&Constant[sizeof(Scalar) *  5]),
-            Load(&Constant[sizeof(Scalar) *  6]),
-            Load(&Constant[sizeof(Scalar) *  7]),
-            Load(&Constant[sizeof(Scalar) *  8]),
-            Load(&Constant[sizeof(Scalar) *  9]),
-            Load(&Constant[sizeof(Scalar) * 10]),
-            Load(&Constant[sizeof(Scalar) * 11]),
-            Load(&Constant[sizeof(Scalar) * 12]),
-            Load(&Constant[sizeof(Scalar) * 13]),
-            Load(&Constant[sizeof(Scalar) * 14]),
-            Load(&Constant[sizeof(Scalar) * 15]),
+            Load128(&Constant[sizeof(Scalar) *  0]),
+            Load128(&Constant[sizeof(Scalar) *  1]),
+            Load128(&Constant[sizeof(Scalar) *  2]),
+            Load128(&Constant[sizeof(Scalar) *  3]),
+            Load128(&Constant[sizeof(Scalar) *  4]),
+            Load128(&Constant[sizeof(Scalar) *  5]),
+            Load128(&Constant[sizeof(Scalar) *  6]),
+            Load128(&Constant[sizeof(Scalar) *  7]),
+            Load128(&Constant[sizeof(Scalar) *  8]),
+            Load128(&Constant[sizeof(Scalar) *  9]),
+            Load128(&Constant[sizeof(Scalar) * 10]),
+            Load128(&Constant[sizeof(Scalar) * 11]),
+            Load128(&Constant[sizeof(Scalar) * 12]),
+            Load128(&Constant[sizeof(Scalar) * 13]),
+            Load128(&Constant[sizeof(Scalar) * 14]),
+            Load128(&Constant[sizeof(Scalar) * 15]),
         };
 
         Scalar v[16] = {
@@ -273,7 +288,7 @@ public:
             c[ 8], c[ 9], c[10], c[11], c[12], c[13], c[14], c[15],
         };
 
-        const Scalar sv = SetAll(seed);
+        const Scalar sv = SetAll128(seed);
         v[ 0] = Xor(v[ 0], sv);
         v[ 1] = Xor(v[ 1], sv);
         v[ 2] = Xor(v[ 2], sv);
@@ -282,26 +297,26 @@ public:
         const Scalar* key = reinterpret_cast<const Scalar*>(data);
         if (bytes >= 256)
             do {
-                v[ 0] = Enc(v[ 0], Load(key++));
-                v[ 1] = Enc(v[ 1], Load(key++));
-                v[ 2] = Enc(v[ 2], Load(key++));
-                v[ 3] = Enc(v[ 3], Load(key++));
-                v[ 4] = Enc(v[ 4], Load(key++));
-                v[ 5] = Enc(v[ 5], Load(key++));
-                v[ 6] = Enc(v[ 6], Load(key++));
-                v[ 7] = Enc(v[ 7], Load(key++));
-                v[ 8] = Enc(v[ 8], Load(key++));
-                v[ 9] = Enc(v[ 9], Load(key++));
-                v[10] = Enc(v[10], Load(key++));
-                v[11] = Enc(v[11], Load(key++));
-                v[12] = Enc(v[12], Load(key++));
-                v[13] = Enc(v[13], Load(key++));
-                v[14] = Enc(v[14], Load(key++));
-                v[15] = Enc(v[15], Load(key++));
+                v[ 0] = Enc(v[ 0], Load128(key++));
+                v[ 1] = Enc(v[ 1], Load128(key++));
+                v[ 2] = Enc(v[ 2], Load128(key++));
+                v[ 3] = Enc(v[ 3], Load128(key++));
+                v[ 4] = Enc(v[ 4], Load128(key++));
+                v[ 5] = Enc(v[ 5], Load128(key++));
+                v[ 6] = Enc(v[ 6], Load128(key++));
+                v[ 7] = Enc(v[ 7], Load128(key++));
+                v[ 8] = Enc(v[ 8], Load128(key++));
+                v[ 9] = Enc(v[ 9], Load128(key++));
+                v[10] = Enc(v[10], Load128(key++));
+                v[11] = Enc(v[11], Load128(key++));
+                v[12] = Enc(v[12], Load128(key++));
+                v[13] = Enc(v[13], Load128(key++));
+                v[14] = Enc(v[14], Load128(key++));
+                v[15] = Enc(v[15], Load128(key++));
             }
             while ((bytes -= 256) >= 256);
 
-        const Scalar lv = SetAll(size);
+        const Scalar lv = SetAll128(size);
         v[ 4] = Xor(v[ 4], lv);
         v[ 5] = Xor(v[ 5], lv);
         v[ 6] = Xor(v[ 6], lv);
@@ -309,68 +324,85 @@ public:
 
         if (bytes > 0) {
             if (bytes >= 64) {
-                v[ 0] = Enc(v[ 0], Load(key++));
-                v[ 1] = Enc(v[ 1], Load(key++));
-                v[ 2] = Enc(v[ 2], Load(key++));
-                v[ 3] = Enc(v[ 3], Load(key++));
+                v[ 0] = Enc(v[ 0], Load128(key++));
+                v[ 1] = Enc(v[ 1], Load128(key++));
+                v[ 2] = Enc(v[ 2], Load128(key++));
+                v[ 3] = Enc(v[ 3], Load128(key++));
             }
             if (bytes >= 128) {
-                v[ 4] = Enc(v[ 4], Load(key++));
-                v[ 5] = Enc(v[ 5], Load(key++));
-                v[ 6] = Enc(v[ 6], Load(key++));
-                v[ 7] = Enc(v[ 7], Load(key++));
+                v[ 4] = Enc(v[ 4], Load128(key++));
+                v[ 5] = Enc(v[ 5], Load128(key++));
+                v[ 6] = Enc(v[ 6], Load128(key++));
+                v[ 7] = Enc(v[ 7], Load128(key++));
             }
             if (bytes >= 192) {
-                v[ 8] = Enc(v[ 8], Load(key++));
-                v[ 9] = Enc(v[ 9], Load(key++));
-                v[10] = Enc(v[10], Load(key++));
-                v[11] = Enc(v[11], Load(key++));
+                v[ 8] = Enc(v[ 8], Load128(key++));
+                v[ 9] = Enc(v[ 9], Load128(key++));
+                v[10] = Enc(v[10], Load128(key++));
+                v[11] = Enc(v[11], Load128(key++));
             }
             if (bytes %= 64) {
-                Scalar tmp[4];
-                int index = 0;
-                if (bytes >= sizeof(Scalar))
-                    do    tmp[index++] = Load(key++);
-                    while ((bytes -= sizeof(Scalar)) >= sizeof(Scalar));
+            #if defined(__AVX512F__)
+                auto vector = Load512(key, bytes);
+                v[12] = Enc(v[12], Lane<0>(vector));
+                v[13] = Enc(v[13], Lane<1>(vector));
+                v[14] = Enc(v[14], Lane<2>(vector));
+                v[15] = Enc(v[15], Lane<3>(vector));
+            #else
+                size_t mask = bytes % sizeof(Scalar);
+                size_t lane = bytes / sizeof(Scalar);
+                Scalar load = mask ? Load128(key + lane, mask) : _mm_setzero_si128();;
 
-                if (bytes %= sizeof(Scalar))
-                    tmp[index++] = Load(key, bytes);
-
-                if (index < 4)
-                    do    tmp[index] = SetAll(0);
-                    while (++index < 4);
-
-                v[12] = Enc(v[12], tmp[0]);
-                v[13] = Enc(v[13], tmp[1]);
-                v[14] = Enc(v[14], tmp[2]);
-                v[15] = Enc(v[15], tmp[3]);
+                switch (lane) {
+                case 0:
+                    v[12] = Enc(v[12], load);
+                    v[13] = Enc(v[13], _mm_setzero_si128());
+                    v[14] = Enc(v[14], _mm_setzero_si128());
+                    v[15] = Enc(v[15], _mm_setzero_si128());
+                    break;
+                case 1:
+                    v[12] = Enc(v[12], Load128(key + 0));
+                    v[13] = Enc(v[13], load);
+                    v[14] = Enc(v[14], _mm_setzero_si128());
+                    v[15] = Enc(v[15], _mm_setzero_si128());
+                    break;
+                case 2:
+                    v[12] = Enc(v[12], Load128(key + 0));
+                    v[13] = Enc(v[13], Load128(key + 1));
+                    v[14] = Enc(v[14], load);
+                    v[15] = Enc(v[15], _mm_setzero_si128());
+                    break;
+                case 3:
+                    v[12] = Enc(v[12], Load128(key + 0));
+                    v[13] = Enc(v[13], Load128(key + 1));
+                    v[14] = Enc(v[14], Load128(key + 2));
+                    v[15] = Enc(v[15], load);
+                }
+            #endif
             }
         }
 
-        Scalar m[16] = {
-            v[ 0], v[ 1], v[ 2], v[ 3], v[ 4], v[ 5], v[ 6], v[ 7],
-            v[ 8], v[ 9], v[10], v[11], v[12], v[13], v[14], v[15]
-        };
+        Scalar m[16];
 
-        m[ 0] = Enc(Xor(Rot(v[ 4], v[ 0]), m[ 0]), Rot(c[ 4], v[ 8]));
-        m[ 1] = Enc(Xor(Rot(v[ 5], v[ 1]), m[ 1]), Rot(c[ 5], v[ 9]));
-        m[ 2] = Enc(Xor(Rot(v[ 6], v[ 2]), m[ 2]), Rot(c[ 6], v[10]));
-        m[ 3] = Enc(Xor(Rot(v[ 7], v[ 3]), m[ 3]), Rot(c[ 7], v[11]));
+        m[ 0] = Enc(Xor(Rot(v[ 4], v[ 0]), v[ 0]), Rot(c[ 4], v[ 8]));
+        m[ 1] = Enc(Xor(Rot(v[ 5], v[ 1]), v[ 1]), Rot(c[ 5], v[ 9]));
+        m[ 2] = Enc(Xor(Rot(v[ 6], v[ 2]), v[ 2]), Rot(c[ 6], v[10]));
+        m[ 3] = Enc(Xor(Rot(v[ 7], v[ 3]), v[ 3]), Rot(c[ 7], v[11]));
 
-        m[ 4] = Enc(Xor(Rot(v[ 8], v[ 4]), m[ 4]), Rot(c[ 0], v[12]));
-        m[ 5] = Enc(Xor(Rot(v[ 9], v[ 5]), m[ 5]), Rot(c[ 1], v[13]));
-        m[ 6] = Enc(Xor(Rot(v[10], v[ 6]), m[ 6]), Rot(c[ 2], v[14]));
-        m[ 7] = Enc(Xor(Rot(v[11], v[ 7]), m[ 7]), Rot(c[ 3], v[15]));
+        m[ 4] = Enc(Xor(Rot(v[ 8], v[ 4]), v[ 4]), Rot(c[ 0], v[12]));
+        m[ 5] = Enc(Xor(Rot(v[ 9], v[ 5]), v[ 5]), Rot(c[ 1], v[13]));
+        m[ 6] = Enc(Xor(Rot(v[10], v[ 6]), v[ 6]), Rot(c[ 2], v[14]));
+        m[ 7] = Enc(Xor(Rot(v[11], v[ 7]), v[ 7]), Rot(c[ 3], v[15]));
 
-        m[ 8] = Enc(Xor(Rot(v[12], v[ 8]), m[ 8]), Rot(c[12], v[ 0]));
-        m[ 9] = Enc(Xor(Rot(v[13], v[ 9]), m[ 9]), Rot(c[13], v[ 1]));
-        m[10] = Enc(Xor(Rot(v[14], v[10]), m[10]), Rot(c[14], v[ 2]));
-        m[11] = Enc(Xor(Rot(v[15], v[11]), m[11]), Rot(c[15], v[ 3]));
+        m[ 8] = Enc(Xor(Rot(v[12], v[ 8]), v[ 8]), Rot(c[12], v[ 0]));
+        m[ 9] = Enc(Xor(Rot(v[13], v[ 9]), v[ 9]), Rot(c[13], v[ 1]));
+        m[10] = Enc(Xor(Rot(v[14], v[10]), v[10]), Rot(c[14], v[ 2]));
+        m[11] = Enc(Xor(Rot(v[15], v[11]), v[11]), Rot(c[15], v[ 3]));
 
-        m[12] = Enc(Xor(Rot(v[ 0], v[12]), m[12]), Rot(c[ 8], v[ 4]));
-        m[13] = Enc(Xor(Rot(v[ 1], v[13]), m[13]), Rot(c[ 9], v[ 5]));
-        m[14] = Enc(Xor(Rot(v[ 2], v[14]), m[14]), Rot(c[10], v[ 6]));
-        m[15] = Enc(Xor(Rot(v[ 3], v[15]), m[15]), Rot(c[11], v[ 7]));
+        m[12] = Enc(Xor(Rot(v[ 0], v[12]), v[12]), Rot(c[ 8], v[ 4]));
+        m[13] = Enc(Xor(Rot(v[ 1], v[13]), v[13]), Rot(c[ 9], v[ 5]));
+        m[14] = Enc(Xor(Rot(v[ 2], v[14]), v[14]), Rot(c[10], v[ 6]));
+        m[15] = Enc(Xor(Rot(v[ 3], v[15]), v[15]), Rot(c[11], v[ 7]));
 
         m[ 0] = Enc(Xor(Rot(v[ 8], v[ 0]), m[ 0]), Rot(c[ 8], v[12]));
         m[ 1] = Enc(Xor(Rot(v[ 9], v[ 1]), m[ 1]), Rot(c[ 9], v[13]));
@@ -447,13 +479,17 @@ public:
 
         // hashing a key from every size in 0..512 bytes should be sufficient to
         // execute every branch in most reasonable implementations
-        char data[512];
+        char data[64 + 512 + 64];
+        for (int i = 0; i <  64; ++i)
+            data[i] = '\x55';
         for (int i = 0; i < 512; ++i)
-            data[i] = i & 0xFF;
+            data[i + 64] = i & 0xFF;
+        for (int i = 0; i <  64; ++i)
+            data[i + 64 + 512] = '\xCC';
 
-        Scalar hash = Hash(data, 0);
+        Scalar hash = Hash(data + 64, 0);
         for (int i = 1; i <= 512; ++i)
-            hash = Xor(hash, Hash(data, i));
+            hash = Xor(hash, Hash(data + 64, i));
 
         char byte[16];
         memcpy(&byte, &hash, sizeof(hash));

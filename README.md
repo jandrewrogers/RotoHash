@@ -8,9 +8,9 @@ This hash design has a high fixed cost but very low marginal cost. It provides s
 ## Performance
 | CPU Architecture | 256K (Aligned) | 256K (Unaligned) | 1000 Bytes | Less Than 256 Bytes |
 | :--------------- | -------------: | ---------------: | ---------: | ------------------: |
-| Intel Sapphire Rapids | 240 GB/s | 130 GB/s | 64 cycles/hash | 60 cycles/hash |
-| AMD Zen 4             | 147 GB/s | 143 GB/s | 79 cycles/hash | 70 cycles/hash |
-| Intel Ice Lake        | 170 GB/s |  60 GB/s | 87 cycles/hash | 82 cycles/hash |
+| Intel Sapphire Rapids | 240 GB/s | 130 GB/s | 62 cycles/hash | 58 cycles/hash |
+| AMD Zen 4             | 147 GB/s | 143 GB/s | 78 cycles/hash | 70 cycles/hash |
+| Intel Ice Lake        | 173 GB/s |  61 GB/s | 86 cycles/hash | 82 cycles/hash |
 
 These values are representative of the pure AVX-512 implementation. On older microarchitectures such as Ice Lake, the 128-bit implementation may be faster in some cases.
 
